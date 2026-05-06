@@ -5,21 +5,22 @@ const TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 2;
 const RETRYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
+// حداکثر 10MB buffer — بیشتر از این رو stream می‌کنیم
+const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+
 const STRIP_REQUEST_HEADERS = new Set([
   "host", "connection", "keep-alive",
   "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade",
   "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
   "x-real-ip", "x-forwarded-for",
-  // ✅ مهم: بذار Deno خودش encoding رو مدیریت کنه
   "accept-encoding",
 ]);
 
-// ✅ هدرهایی که Deno خودش اونا رو تغییر می‌ده و باید strip بشن
 const STRIP_RESPONSE_HEADERS = new Set([
   "transfer-encoding",
-  "content-encoding",  // ✅ Deno قبلاً decompress کرده، این header گمراه‌کننده‌ست
-  "content-length",    // ✅ بعد از decompress، طول عوض شده و غلطه
+  "content-encoding",
+  "content-length",
 ]);
 
 function buildRequestHeaders(request, clientIp) {
@@ -31,7 +32,6 @@ function buildRequestHeaders(request, clientIp) {
     headers.set(k, value);
   }
   if (clientIp) headers.set("x-forwarded-for", clientIp);
-  // ✅ صریحاً بگو uncompressed می‌خوایم تا Deno مشکل نداشته باشه
   headers.set("accept-encoding", "identity");
   return headers;
 }
@@ -60,6 +60,20 @@ async function fetchWithTimeout(url, options, ms) {
   } finally {
     clearTimeout(t);
   }
+}
+
+// ✅ بررسی اینکه response نیاز به buffer داره یا نه
+function shouldBuffer(headers) {
+  const contentType = headers.get("content-type") || "";
+  const contentLength = parseInt(headers.get("content-length") || "0", 10);
+
+  // فایل‌های بزرگ یا binary رو stream کن
+  if (contentLength > MAX_BUFFER_SIZE) return false;
+  if (contentType.includes("video/") || contentType.includes("audio/")) return false;
+  if (contentType.includes("application/octet-stream")) return false;
+
+  // بقیه رو buffer کن
+  return true;
 }
 
 export default async function handler(request, context) {
@@ -102,7 +116,24 @@ export default async function handler(request, context) {
       const responseHeaders = buildResponseHeaders(upstream.headers);
       rewriteLocationHeader(responseHeaders);
 
-      return new Response(upstream.body, {
+      // ✅ buffer کردن response برای جلوگیری از قطع stream
+      let responseBody;
+      if (upstream.body && shouldBuffer(upstream.headers)) {
+        try {
+          const buffered = await upstream.arrayBuffer();
+          // content-length درست رو بذار چون حالا می‌دونیم دقیقاً چقدره
+          responseHeaders.set("content-length", String(buffered.byteLength));
+          responseBody = buffered;
+        } catch {
+          // اگه buffer کردن fail شد، stream رو مستقیم بفرست
+          responseBody = upstream.body;
+        }
+      } else {
+        // فایل‌های بزرگ رو stream کن
+        responseBody = upstream.body;
+      }
+
+      return new Response(responseBody, {
         status: upstream.status,
         headers: responseHeaders,
       });
