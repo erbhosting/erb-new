@@ -1,7 +1,10 @@
 import type { Config, Context } from "@netlify/edge-functions";
 
 const TARGET_BASE = (Netlify.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
-const TIMEOUT_MS = 30_000;
+
+// ✅ timeout طراحی‌شده بر اساس سقف 40s Netlify:
+// 12s + 0.2s + 12s + 0.4s + 12s = ~36.6s (زیر سقف 40s)
+const TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 2;
 
 const STRIP_HEADERS = new Set([
@@ -9,8 +12,7 @@ const STRIP_HEADERS = new Set([
   "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade",
   "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
-  // اینا رو Netlify خودش مدیریت می‌کنه
-  "x-real-ip", "x-forwarded-for",
+  "x-real-ip", "x-forwarded-for", // Netlify از context.ip مدیریت می‌کنه
 ]);
 
 function buildHeaders(request: Request, clientIp: string): Headers {
@@ -21,37 +23,27 @@ function buildHeaders(request: Request, clientIp: string): Headers {
     if (k.startsWith("x-nf-") || k.startsWith("x-netlify-")) continue;
     headers.set(k, value);
   }
-  // ✅ از context.ip استفاده می‌کنیم، دقیق‌تر از header parsing
   if (clientIp) headers.set("x-forwarded-for", clientIp);
   return headers;
 }
 
-async function fetchWithTimeout(
-  url: string,
-  options: RequestInit,
-  timeoutMs: number
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+async function fetchWithTimeout(url: string, options: RequestInit, ms: number) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, { ...options, signal: ctrl.signal });
   } finally {
-    clearTimeout(timer);
+    clearTimeout(t);
   }
 }
 
-export default async function handler(
-  request: Request,
-  context: Context  // ✅ از Context API استفاده می‌کنیم
-) {
+export default async function handler(request: Request, context: Context) {
   if (!TARGET_BASE) {
     return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
   }
 
-  const url = new URL(request.url);
-  const targetUrl = TARGET_BASE + url.pathname + url.search;
-
-  // ✅ context.ip به جای parse دستی header
+  const { pathname, search } = new URL(request.url);
+  const targetUrl = TARGET_BASE + pathname + search;
   const headers = buildHeaders(request, context.ip);
   const method = request.method;
   const hasBody = method !== "GET" && method !== "HEAD";
@@ -61,7 +53,7 @@ export default async function handler(
     try {
       bodyBuffer = await request.arrayBuffer();
     } catch {
-      return new Response("Bad Request: Failed to read body", { status: 400 });
+      return new Response("Bad Request: Cannot read body", { status: 400 });
     }
   }
 
@@ -80,52 +72,42 @@ export default async function handler(
         TIMEOUT_MS
       );
 
-      const responseHeaders = new Headers();
-      for (const [key, value] of upstream.headers) {
-        if (key.toLowerCase() === "transfer-encoding") continue;
-        responseHeaders.set(key, value);
-      }
+      const responseHeaders = new Headers(upstream.headers);
+      responseHeaders.delete("transfer-encoding");
 
       return new Response(upstream.body, {
         status: upstream.status,
         headers: responseHeaders,
       });
 
-    } catch (error) {
-      lastError = error;
-
-      const isTimeout =
-        error instanceof DOMException && error.name === "AbortError";
-
+    } catch (err) {
+      lastError = err;
+      const isTimeout = err instanceof DOMException && err.name === "AbortError";
       if (isTimeout || attempt === MAX_RETRIES) break;
-
-      // backoff بین retry‌ها
-      await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+      await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
     }
   }
 
-  const isTimeout =
-    lastError instanceof DOMException && (lastError as DOMException).name === "AbortError";
+  const isTimeout = lastError instanceof DOMException &&
+    (lastError as DOMException).name === "AbortError";
 
-  // ✅ context.waitUntil برای لاگ بعد از ارسال response
+  // لاگ background بعد از ارسال response
   context.waitUntil(
     Promise.resolve(
-      console.error(
-        `[${context.requestId}] Relay failed to ${targetUrl}:`,
-        lastError
-      )
+      console.error(`[${context.requestId}] Proxy failed → ${targetUrl}`, lastError)
     )
   );
 
   return new Response(
-    isTimeout
-      ? "Gateway Timeout: Upstream took too long"
-      : "Bad Gateway: Relay Failed",
+    isTimeout ? "Gateway Timeout" : "Bad Gateway",
     { status: isTimeout ? 504 : 502 }
   );
 }
 
-// ✅ تعریف path مستقیم در فایل، نیازی به netlify.toml نیست
 export const config: Config = {
   path: "/*",
+  // ✅ فایل‌های static نیازی به proxy ندارن
+  excludedPath: ["/*.css", "/*.js", "/*.png", "/*.jpg", "/*.svg", "/*.ico", "/*.woff2"],
+  // ✅ در صورت crash کامل function، به origin برگرد
+  onError: "bypass",
 };
