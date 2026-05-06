@@ -1,27 +1,23 @@
 const TARGET_BASE = (Netlify.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
 const NETLIFY_BASE = (Netlify.env.get("URL") || "").replace(/\/$/, "");
 
-const TIMEOUT_MS = 12_000;
-const MAX_RETRIES = 2;
+const TIMEOUT_MS = 25_000; // یه timeout برای کل عملیات (headers + body)
 const RETRYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
-
-// حداکثر 10MB buffer — بیشتر از این رو stream می‌کنیم
-const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
 
 const STRIP_REQUEST_HEADERS = new Set([
   "host", "connection", "keep-alive",
   "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade",
   "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
-  "x-real-ip", "x-forwarded-for",
-  "accept-encoding",
+  "x-real-ip", "x-forwarded-for", "accept-encoding",
 ]);
 
 const STRIP_RESPONSE_HEADERS = new Set([
-  "transfer-encoding",
-  "content-encoding",
-  "content-length",
+  "transfer-encoding", "content-encoding", "content-length",
 ]);
+
+// responses بدون body
+const NO_BODY_STATUSES = new Set([101, 204, 205, 304]);
 
 function buildRequestHeaders(request, clientIp) {
   const headers = new Headers();
@@ -45,35 +41,11 @@ function buildResponseHeaders(upstreamHeaders) {
   return headers;
 }
 
-function rewriteLocationHeader(headers) {
-  const location = headers.get("location");
-  if (location && TARGET_BASE && NETLIFY_BASE && location.startsWith(TARGET_BASE)) {
-    headers.set("location", NETLIFY_BASE + location.slice(TARGET_BASE.length));
+function rewriteLocation(headers) {
+  const loc = headers.get("location");
+  if (loc && TARGET_BASE && NETLIFY_BASE && loc.startsWith(TARGET_BASE)) {
+    headers.set("location", NETLIFY_BASE + loc.slice(TARGET_BASE.length));
   }
-}
-
-async function fetchWithTimeout(url, options, ms) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-// ✅ بررسی اینکه response نیاز به buffer داره یا نه
-function shouldBuffer(headers) {
-  const contentType = headers.get("content-type") || "";
-  const contentLength = parseInt(headers.get("content-length") || "0", 10);
-
-  // فایل‌های بزرگ یا binary رو stream کن
-  if (contentLength > MAX_BUFFER_SIZE) return false;
-  if (contentType.includes("video/") || contentType.includes("audio/")) return false;
-  if (contentType.includes("application/octet-stream")) return false;
-
-  // بقیه رو buffer کن
-  return true;
 }
 
 export default async function handler(request, context) {
@@ -83,77 +55,72 @@ export default async function handler(request, context) {
 
   const { pathname, search } = new URL(request.url);
   const targetUrl = TARGET_BASE + pathname + search;
-  const headers = buildRequestHeaders(request, context.ip);
   const method = request.method;
-  const hasBody = method !== "GET" && method !== "HEAD";
+
+  // یه AbortController برای کل عملیات
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
 
   let bodyBuffer = null;
-  if (hasBody && request.body) {
+  if (method !== "GET" && method !== "HEAD" && request.body) {
     try {
       bodyBuffer = await request.arrayBuffer();
     } catch {
+      clearTimeout(timer);
       return new Response("Bad Request: Cannot read body", { status: 400 });
     }
   }
 
+  const reqHeaders = buildRequestHeaders(request, context.ip);
   const canRetry = RETRYABLE_METHODS.has(method);
-  const maxAttempts = canRetry ? MAX_RETRIES : 0;
   let lastError;
 
-  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+  for (let attempt = 0; attempt <= (canRetry ? 2 : 0); attempt++) {
     try {
-      const upstream = await fetchWithTimeout(
-        targetUrl,
-        {
-          method,
-          headers,
-          redirect: "manual",
-          ...(bodyBuffer !== null && { body: bodyBuffer }),
-        },
-        TIMEOUT_MS
-      );
-
-      const responseHeaders = buildResponseHeaders(upstream.headers);
-      rewriteLocationHeader(responseHeaders);
-
-      // ✅ buffer کردن response برای جلوگیری از قطع stream
-      let responseBody;
-      if (upstream.body && shouldBuffer(upstream.headers)) {
-        try {
-          const buffered = await upstream.arrayBuffer();
-          // content-length درست رو بذار چون حالا می‌دونیم دقیقاً چقدره
-          responseHeaders.set("content-length", String(buffered.byteLength));
-          responseBody = buffered;
-        } catch {
-          // اگه buffer کردن fail شد، stream رو مستقیم بفرست
-          responseBody = upstream.body;
-        }
-      } else {
-        // فایل‌های بزرگ رو stream کن
-        responseBody = upstream.body;
+      if (attempt > 0) {
+        await new Promise(r => setTimeout(r, 300 * attempt));
       }
 
-      return new Response(responseBody, {
-        status: upstream.status,
-        headers: responseHeaders,
+      const upstream = await fetch(targetUrl, {
+        method,
+        headers: reqHeaders,
+        redirect: "manual",
+        signal: ctrl.signal,
+        ...(bodyBuffer !== null && { body: bodyBuffer }),
       });
+
+      const resHeaders = buildResponseHeaders(upstream.headers);
+      rewriteLocation(resHeaders);
+
+      // responses بدون body رو همینجا برگردون
+      if (NO_BODY_STATUSES.has(upstream.status) || method === "HEAD") {
+        clearTimeout(timer);
+        return new Response(null, { status: upstream.status, headers: resHeaders });
+      }
+
+      // ✅ کل body رو buffer کن — همون AbortController بالا محافظت می‌کنه
+      const buffered = await upstream.arrayBuffer();
+      clearTimeout(timer);
+
+      resHeaders.set("content-length", String(buffered.byteLength));
+      return new Response(buffered, { status: upstream.status, headers: resHeaders });
 
     } catch (err) {
       lastError = err;
-      const isTimeout = err instanceof DOMException && err.name === "AbortError";
-      if (isTimeout || attempt === maxAttempts) break;
-      await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
+      // فقط اگه timeout نشده retry کن
+      if (ctrl.signal.aborted) break;
     }
   }
 
-  const isTimeout = lastError instanceof DOMException && lastError.name === "AbortError";
+  clearTimeout(timer);
 
   context.waitUntil(
     Promise.resolve(
-      console.error(`[${context.requestId}] Proxy failed → ${targetUrl}`, lastError)
+      console.error(`[${context.requestId}] failed → ${targetUrl}`, lastError)
     )
   );
 
+  const isTimeout = ctrl.signal.aborted;
   return new Response(
     isTimeout ? "Gateway Timeout" : "Bad Gateway",
     { status: isTimeout ? 504 : 502 }
