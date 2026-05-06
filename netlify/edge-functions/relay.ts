@@ -1,21 +1,21 @@
-import type { Config, Context } from "@netlify/edge-functions";
-
 const TARGET_BASE = (Netlify.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
+const NETLIFY_BASE = (Netlify.env.get("NETLIFY_URL") || "").replace(/\/$/, "");
 
-// ✅ timeout طراحی‌شده بر اساس سقف 40s Netlify:
-// 12s + 0.2s + 12s + 0.4s + 12s = ~36.6s (زیر سقف 40s)
 const TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 2;
+
+// فقط این متدها idempotent هستن و می‌شه retry کرد
+const RETRYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 const STRIP_HEADERS = new Set([
   "host", "connection", "keep-alive",
   "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade",
   "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
-  "x-real-ip", "x-forwarded-for", // Netlify از context.ip مدیریت می‌کنه
+  "x-real-ip", "x-forwarded-for",
 ]);
 
-function buildHeaders(request: Request, clientIp: string): Headers {
+function buildHeaders(request, clientIp) {
   const headers = new Headers();
   for (const [key, value] of request.headers) {
     const k = key.toLowerCase();
@@ -27,7 +27,7 @@ function buildHeaders(request: Request, clientIp: string): Headers {
   return headers;
 }
 
-async function fetchWithTimeout(url: string, options: RequestInit, ms: number) {
+async function fetchWithTimeout(url, options, ms) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -37,7 +37,17 @@ async function fetchWithTimeout(url: string, options: RequestInit, ms: number) {
   }
 }
 
-export default async function handler(request: Request, context: Context) {
+// ✅ باگ ۳: بازنویسی Location header در redirect‌ها
+function rewriteLocationHeader(headers) {
+  const location = headers.get("location");
+  if (location && TARGET_BASE && NETLIFY_BASE) {
+    if (location.startsWith(TARGET_BASE)) {
+      headers.set("location", NETLIFY_BASE + location.slice(TARGET_BASE.length));
+    }
+  }
+}
+
+export default async function handler(request, context) {
   if (!TARGET_BASE) {
     return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
   }
@@ -48,7 +58,7 @@ export default async function handler(request: Request, context: Context) {
   const method = request.method;
   const hasBody = method !== "GET" && method !== "HEAD";
 
-  let bodyBuffer: ArrayBuffer | null = null;
+  let bodyBuffer = null;
   if (hasBody && request.body) {
     try {
       bodyBuffer = await request.arrayBuffer();
@@ -57,9 +67,12 @@ export default async function handler(request: Request, context: Context) {
     }
   }
 
-  let lastError: unknown;
+  // ✅ باگ ۲: فقط متدهای idempotent رو retry کن
+  const canRetry = RETRYABLE_METHODS.has(method);
+  const maxAttempts = canRetry ? MAX_RETRIES : 0;
+  let lastError;
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
     try {
       const upstream = await fetchWithTimeout(
         targetUrl,
@@ -75,6 +88,9 @@ export default async function handler(request: Request, context: Context) {
       const responseHeaders = new Headers(upstream.headers);
       responseHeaders.delete("transfer-encoding");
 
+      // ✅ باگ ۳: Location رو بازنویسی کن
+      rewriteLocationHeader(responseHeaders);
+
       return new Response(upstream.body, {
         status: upstream.status,
         headers: responseHeaders,
@@ -83,15 +99,13 @@ export default async function handler(request: Request, context: Context) {
     } catch (err) {
       lastError = err;
       const isTimeout = err instanceof DOMException && err.name === "AbortError";
-      if (isTimeout || attempt === MAX_RETRIES) break;
+      if (isTimeout || attempt === maxAttempts) break;
       await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
     }
   }
 
-  const isTimeout = lastError instanceof DOMException &&
-    (lastError as DOMException).name === "AbortError";
+  const isTimeout = lastError instanceof DOMException && lastError.name === "AbortError";
 
-  // لاگ background بعد از ارسال response
   context.waitUntil(
     Promise.resolve(
       console.error(`[${context.requestId}] Proxy failed → ${targetUrl}`, lastError)
@@ -104,10 +118,8 @@ export default async function handler(request: Request, context: Context) {
   );
 }
 
-export const config: Config = {
+export const config = {
   path: "/*",
-  // ✅ فایل‌های static نیازی به proxy ندارن
-  excludedPath: ["/*.css", "/*.js", "/*.png", "/*.jpg", "/*.svg", "/*.ico", "/*.woff2"],
-  // ✅ در صورت crash کامل function، به origin برگرد
+  // ❌ excludedPath حذف شد — همه فایل‌ها باید proxy بشن
   onError: "bypass",
 };
