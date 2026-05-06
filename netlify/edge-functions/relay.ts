@@ -1,30 +1,55 @@
 const TARGET_BASE = (Netlify.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
-const NETLIFY_BASE = (Netlify.env.get("NETLIFY_URL") || "").replace(/\/$/, "");
+const NETLIFY_BASE = (Netlify.env.get("URL") || "").replace(/\/$/, "");
 
 const TIMEOUT_MS = 12_000;
 const MAX_RETRIES = 2;
-
-// فقط این متدها idempotent هستن و می‌شه retry کرد
 const RETRYABLE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
-const STRIP_HEADERS = new Set([
+const STRIP_REQUEST_HEADERS = new Set([
   "host", "connection", "keep-alive",
   "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade",
   "forwarded", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
   "x-real-ip", "x-forwarded-for",
+  // ✅ مهم: بذار Deno خودش encoding رو مدیریت کنه
+  "accept-encoding",
 ]);
 
-function buildHeaders(request, clientIp) {
+// ✅ هدرهایی که Deno خودش اونا رو تغییر می‌ده و باید strip بشن
+const STRIP_RESPONSE_HEADERS = new Set([
+  "transfer-encoding",
+  "content-encoding",  // ✅ Deno قبلاً decompress کرده، این header گمراه‌کننده‌ست
+  "content-length",    // ✅ بعد از decompress، طول عوض شده و غلطه
+]);
+
+function buildRequestHeaders(request, clientIp) {
   const headers = new Headers();
   for (const [key, value] of request.headers) {
     const k = key.toLowerCase();
-    if (STRIP_HEADERS.has(k)) continue;
+    if (STRIP_REQUEST_HEADERS.has(k)) continue;
     if (k.startsWith("x-nf-") || k.startsWith("x-netlify-")) continue;
     headers.set(k, value);
   }
   if (clientIp) headers.set("x-forwarded-for", clientIp);
+  // ✅ صریحاً بگو uncompressed می‌خوایم تا Deno مشکل نداشته باشه
+  headers.set("accept-encoding", "identity");
   return headers;
+}
+
+function buildResponseHeaders(upstreamHeaders) {
+  const headers = new Headers();
+  for (const [key, value] of upstreamHeaders) {
+    if (STRIP_RESPONSE_HEADERS.has(key.toLowerCase())) continue;
+    headers.set(key, value);
+  }
+  return headers;
+}
+
+function rewriteLocationHeader(headers) {
+  const location = headers.get("location");
+  if (location && TARGET_BASE && NETLIFY_BASE && location.startsWith(TARGET_BASE)) {
+    headers.set("location", NETLIFY_BASE + location.slice(TARGET_BASE.length));
+  }
 }
 
 async function fetchWithTimeout(url, options, ms) {
@@ -37,16 +62,6 @@ async function fetchWithTimeout(url, options, ms) {
   }
 }
 
-// ✅ باگ ۳: بازنویسی Location header در redirect‌ها
-function rewriteLocationHeader(headers) {
-  const location = headers.get("location");
-  if (location && TARGET_BASE && NETLIFY_BASE) {
-    if (location.startsWith(TARGET_BASE)) {
-      headers.set("location", NETLIFY_BASE + location.slice(TARGET_BASE.length));
-    }
-  }
-}
-
 export default async function handler(request, context) {
   if (!TARGET_BASE) {
     return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
@@ -54,7 +69,7 @@ export default async function handler(request, context) {
 
   const { pathname, search } = new URL(request.url);
   const targetUrl = TARGET_BASE + pathname + search;
-  const headers = buildHeaders(request, context.ip);
+  const headers = buildRequestHeaders(request, context.ip);
   const method = request.method;
   const hasBody = method !== "GET" && method !== "HEAD";
 
@@ -67,7 +82,6 @@ export default async function handler(request, context) {
     }
   }
 
-  // ✅ باگ ۲: فقط متدهای idempotent رو retry کن
   const canRetry = RETRYABLE_METHODS.has(method);
   const maxAttempts = canRetry ? MAX_RETRIES : 0;
   let lastError;
@@ -85,10 +99,7 @@ export default async function handler(request, context) {
         TIMEOUT_MS
       );
 
-      const responseHeaders = new Headers(upstream.headers);
-      responseHeaders.delete("transfer-encoding");
-
-      // ✅ باگ ۳: Location رو بازنویسی کن
+      const responseHeaders = buildResponseHeaders(upstream.headers);
       rewriteLocationHeader(responseHeaders);
 
       return new Response(upstream.body, {
@@ -120,6 +131,5 @@ export default async function handler(request, context) {
 
 export const config = {
   path: "/*",
-  // ❌ excludedPath حذف شد — همه فایل‌ها باید proxy بشن
   onError: "bypass",
 };
